@@ -198,6 +198,8 @@ __PACKAGE__->register_method({
     name => 'list',
     path => 'envs',
     method => 'GET',
+    # may repair stale records, which needs write access to pmxcfs
+    protected => 1,
     description => "List managed environments with their live VM status.",
     permissions => {
         description => "Only environments whose VM you can audit (VM.Audit), or that you own,"
@@ -516,7 +518,8 @@ __PACKAGE__->register_method({
             if $tmpl_info->{type} ne 'qemu';
 
         my $tmpl_node = $tmpl_info->{node};
-        my $ostype = PVE::Cluster::get_guest_config_property('ostype', $template)->{$template}
+        my $ostype =
+            ((PVE::Cluster::get_guest_config_property('ostype', $template) // {})->{$template} // {})
             ->{ostype};
 
         $rpcenv->check($authuser, "/vms/$template", ['VM.Clone']);
@@ -698,9 +701,16 @@ sub start_envs {
     my $startlist = { 0 => {} };
     my $vmid_to_id = {};
     for my $id (@$ids) {
-        my $env = $db->{environments}->{$id} or next;
+        my $env = $db->{environments}->{$id};
+        if (!$env) {
+            log_warn("environment $id does not exist\n");
+            next;
+        }
         my $vmid = $env->{vmid};
-        next if !defined($vmid) || !$stats->{$vmid};
+        if (!defined($vmid) || !$stats->{$vmid}) {
+            log_warn("environment $id: VM " . ($vmid // '-') . " does not exist\n");
+            next;
+        }
         $startlist->{0}->{$vmid} = { node => $stats->{$vmid}->{node}, type => 'qemu' };
         $vmid_to_id->{$vmid} = $id;
     }
@@ -899,7 +909,9 @@ __PACKAGE__->register_method({
         raise_param_exc({ vmid => "VM $vmid is not a QEMU VM" }) if $vm->{type} ne 'qemu';
         raise_param_exc({ vmid => "VM $vmid is a template" }) if $vm->{template};
 
-        my $ostype = PVE::Cluster::get_guest_config_property('ostype', $vmid)->{$vmid}->{ostype};
+        my $ostype =
+            ((PVE::Cluster::get_guest_config_property('ostype', $vmid) // {})->{$vmid} // {})
+            ->{ostype};
 
         return PVE::EnvManager::lock_db(sub {
             my ($db) = @_;
