@@ -129,7 +129,18 @@ Ext.define('PVE.dc.Config', {
             title: gettext('Environments'),
             iconCls: 'fa fa-cubes',
             itemId: 'environments',
+            expandedOnInit: true,
         });
+
+        if (caps.dc['Sys.Audit']) {
+            me.items.push({
+                xtype: 'pveDcEnvProxies',
+                title: gettext('Proxies'),
+                iconCls: 'fa fa-exchange',
+                itemId: 'env-proxies',
+                groups: ['environments'],
+            });
+        }
 
         if (caps.storage['Datastore.Allocate'] || caps.dc['Sys.Audit']) {
             me.items.push({

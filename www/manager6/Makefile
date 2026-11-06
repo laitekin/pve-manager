@@ -181,6 +181,7 @@ JSSRC= 							\
 	dc/CPUTypeEdit.js				\
 	dc/CPUTypeView.js				\
 	dc/Environments.js				\
+	dc/EnvProxies.js				\
 	dc/GroupEdit.js					\
 	dc/GroupView.js					\
 	dc/Guests.js					\

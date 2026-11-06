@@ -265,12 +265,29 @@ Ext.define('PVE.Utils', {
                 creating: ['refresh fa-spin', gettext('Creating')],
                 deleting: ['refresh fa-spin', gettext('Deleting')],
                 missing: ['exclamation-triangle warning', gettext('VM missing')],
+                'proxy-failed': ['times-circle critical', gettext('Proxy failed')],
+                'exit-changed': ['exclamation-triangle warning', gettext('Exit IP changed')],
                 error: ['times-circle critical', gettext('Error')],
             };
             let [icon, text] = map[value] ?? ['question-circle', value ?? ''];
             let qtip = error ? ` data-qtip="${Ext.htmlEncode(Ext.htmlEncode(error))}"` : '';
             let warn = error && value === 'ok' ? ' <i class="fa fa-exclamation-circle warning"></i>' : '';
             return `<span${qtip}><i class="fa fa-fw fa-${icon}"></i> ${text}${warn}</span>`;
+        },
+
+        render_env_proxy_state: function (value, data) {
+            let map = {
+                active: ['check-circle good', gettext('Active')],
+                failed: ['times-circle critical', gettext('Failed')],
+                disabled: ['ban', gettext('Disabled')],
+            };
+            let [icon, text] = map[value] ?? ['question-circle', value ?? ''];
+            if (value === 'active' && data?.expired) {
+                [icon, text] = ['clock-o warning', gettext('Expired')];
+            }
+            let error = data?.['last-check']?.error;
+            let qtip = error ? ` data-qtip="${Ext.htmlEncode(Ext.htmlEncode(error))}"` : '';
+            return `<span${qtip}><i class="fa fa-fw fa-${icon}"></i> ${text}</span>`;
         },
 
         render_zfs_health: function (value) {
@@ -2224,6 +2241,7 @@ Ext.define('PVE.Utils', {
             download: [gettext('File'), gettext('Download')],
             envcreate: ['', gettext('Create environments')],
             envdestroy: [gettext('Environment'), gettext('Destroy')],
+            envproxycheck: ['', gettext('Check environment proxies')],
             envreboot: ['', gettext('Reboot environments')],
             envshutdown: ['', gettext('Shutdown environments')],
             envstart: ['', gettext('Start environments')],

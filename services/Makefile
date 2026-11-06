@@ -13,6 +13,8 @@ SERVICES=			\
 	pve-storage.target	\
 	pve-daily-update.service\
 	pve-daily-update.timer	\
+	pve-env-proxycheck.service	\
+	pve-env-proxycheck.timer	\
 	pvescheduler.service	\
 	pve-sdn-commit.service	\
 	pve-firewall-commit.service

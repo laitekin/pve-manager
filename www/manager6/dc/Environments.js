@@ -16,6 +16,10 @@ Ext.define('pve-environment', {
         'task',
         'lock',
         'created',
+        'proxy-binding',
+        'proxy-state',
+        'proxy-label',
+        'exit-ip',
         { name: 'cpu', type: 'float' },
         { name: 'maxcpu', type: 'float' },
         { name: 'mem', type: 'int' },
@@ -218,6 +222,70 @@ Ext.define('PVE.dc.Environments', {
             this.remove(true);
         },
 
+        bindProxy: function () {
+            let me = this;
+            let sel = me.selected();
+            if (sel.length !== 1) {
+                return;
+            }
+            Ext.create('PVE.window.EnvProxyBind', {
+                autoShow: true,
+                envId: sel[0].data.id,
+                listeners: { destroy: () => me.reload() },
+            });
+        },
+
+        unbindProxy: function () {
+            let me = this;
+            let sel = me.selected();
+            if (sel.length !== 1) {
+                return;
+            }
+            let env = sel[0].data;
+            Ext.Msg.confirm(
+                gettext('Confirm'),
+                Ext.String.format(
+                    gettext('Remove proxy binding of {0}?'),
+                    Ext.htmlEncode(env.name),
+                ),
+                (btn) =>
+                    btn === 'yes' &&
+                    Proxmox.Utils.API2Request({
+                        url: `/cluster/environments/envs/${env.id}/proxy`,
+                        method: 'DELETE',
+                        failure: (response) =>
+                            Ext.Msg.alert(gettext('Error'), response.htmlStatus),
+                        callback: () => me.reload(),
+                    }),
+            );
+        },
+
+        acceptExitIP: function () {
+            let me = this;
+            let sel = me.selected();
+            if (sel.length !== 1) {
+                return;
+            }
+            let env = sel[0].data;
+            Ext.Msg.confirm(
+                gettext('Confirm'),
+                Ext.String.format(
+                    gettext('Accept the new exit IP {0} for {1}?'),
+                    env['exit-ip'] ?? '-',
+                    Ext.htmlEncode(env.name),
+                ),
+                (btn) =>
+                    btn === 'yes' &&
+                    Proxmox.Utils.API2Request({
+                        url: `/cluster/environments/envs/${env.id}/accept-exit-ip`,
+                        method: 'POST',
+                        failure: (response) =>
+                            Ext.Msg.alert(gettext('Error'), response.htmlStatus),
+                        callback: () => me.reload(),
+                    }),
+            );
+        },
+
         showTask: function () {
             let sel = this.selected();
             if (sel.length === 1 && sel[0].data.task) {
@@ -242,6 +310,10 @@ Ext.define('PVE.dc.Environments', {
             me.lookup('removeBtn').setDisabled(!one || one.state === 'creating');
             me.lookup('taskBtn').setDisabled(!(one && one.task));
             me.lookup('gotoBtn').setDisabled(!(one && hasVM));
+            me.lookup('proxyBtn').setDisabled(!one);
+            me.lookup('bindBtn').setDisabled(!(one && !one['proxy-binding']));
+            me.lookup('unbindBtn').setDisabled(!(one && one['proxy-binding']));
+            me.lookup('acceptBtn').setDisabled(!(one && one.health === 'exit-changed'));
         },
 
         init: function (view) {
@@ -304,6 +376,31 @@ Ext.define('PVE.dc.Environments', {
             reference: 'editBtn',
             iconCls: 'fa fa-pencil',
             handler: 'edit',
+        },
+        {
+            text: gettext('Proxy'),
+            reference: 'proxyBtn',
+            iconCls: 'fa fa-exchange',
+            menu: [
+                {
+                    text: gettext('Bind'),
+                    reference: 'bindBtn',
+                    iconCls: 'fa fa-link',
+                    handler: 'bindProxy',
+                },
+                {
+                    text: gettext('Unbind'),
+                    reference: 'unbindBtn',
+                    iconCls: 'fa fa-chain-broken',
+                    handler: 'unbindProxy',
+                },
+                {
+                    text: gettext('Accept new exit IP'),
+                    reference: 'acceptBtn',
+                    iconCls: 'fa fa-check',
+                    handler: 'acceptExitIP',
+                },
+            ],
         },
         {
             text: gettext('Task'),
@@ -371,6 +468,17 @@ Ext.define('PVE.dc.Environments', {
             dataIndex: 'os',
             width: 90,
             renderer: (v) => PVE.Utils.render_env_os(v),
+        },
+        {
+            header: gettext('Proxy'),
+            dataIndex: 'proxy-label',
+            width: 180,
+            renderer: Ext.htmlEncode,
+        },
+        {
+            header: gettext('Exit IP'),
+            dataIndex: 'exit-ip',
+            width: 130,
         },
         {
             header: gettext('CPU usage'),

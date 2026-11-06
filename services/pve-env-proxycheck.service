@@ -1,0 +1,9 @@
+[Unit]
+Description=Check proxies of managed environments
+After=network-online.target pve-cluster.service pvedaemon.service
+Wants=network-online.target pve-cluster.service
+ConditionPathExists=/etc/pve/env-manager/environments.json
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/pvesh create /cluster/environments/proxy-check

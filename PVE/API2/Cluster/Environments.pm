@@ -74,11 +74,23 @@ my $env_properties = {
         type => 'string',
         optional => 1,
         description => "Summary for display: 'ok', 'missing' (VM vanished), 'creating',"
-            . " 'error' or 'deleting'.",
+            . " 'error', 'deleting', 'proxy-failed' or 'exit-changed'.",
     },
     error => { type => 'string', optional => 1, description => "Last error, if any." },
     task => { type => 'string', optional => 1, description => "UPID of the last env task." },
     created => { type => 'integer', optional => 1 },
+    'proxy-binding' => {
+        type => 'object',
+        optional => 1,
+        description => "Bound proxy: 'proxy' ID, 'bound' time and the accepted 'exit-ip'.",
+    },
+    'proxy-state' => { type => 'string', optional => 1 },
+    'proxy-label' => { type => 'string', optional => 1 },
+    'exit-ip' => {
+        type => 'string',
+        optional => 1,
+        description => "Last observed exit IP of the bound proxy.",
+    },
 };
 
 my $get_vm_stats = sub {
@@ -178,7 +190,7 @@ __PACKAGE__->register_method({
         links => [{ rel => 'child', href => "{name}" }],
     },
     code => sub {
-        return [map { { name => $_ } } qw(action adopt envs options templates)];
+        return [map { { name => $_ } } qw(action adopt envs options proxies proxy-check proxy-import templates)];
     },
 });
 
@@ -235,7 +247,7 @@ __PACKAGE__->register_method({
             my $env = $db->{environments}->{$id};
             next if !$can_see_env->($rpcenv, $authuser, $env);
             my $vm = defined($env->{vmid}) ? $stats->{ $env->{vmid} } : undef;
-            push @$res, PVE::EnvManager::merge_status($env, $vm);
+            push @$res, PVE::EnvManager::merge_status($env, $vm, $db);
         }
 
         return $res;
@@ -323,6 +335,27 @@ my $option_properties = {
         minimum => 0,
         optional => 1,
     },
+    'proxy-check-url' => {
+        description => "URL fetched through each proxy to determine its exit IP (JSON with"
+            . " an 'ip' property, or a plain-text IP).",
+        type => 'string',
+        pattern => 'https?://\\S+',
+        maxLength => 512,
+        optional => 1,
+    },
+    'proxy-fail-threshold' => {
+        description => "Consecutive failed checks after which a proxy is marked failed.",
+        type => 'integer',
+        minimum => 1,
+        maximum => 100,
+        optional => 1,
+    },
+    'proxy-fail-closed' => {
+        description => "Refuse to start environments whose proxy is failed, expired or whose"
+            . " exit IP changed.",
+        type => 'boolean',
+        optional => 1,
+    },
 };
 
 __PACKAGE__->register_method({
@@ -341,7 +374,9 @@ __PACKAGE__->register_method({
     },
     code => sub {
         my $db = PVE::EnvManager::read_db();
-        return PVE::EnvManager::get_options($db);
+        my $opts = PVE::EnvManager::get_options($db);
+        $opts->{'proxy-fail-closed'} = $opts->{'proxy-fail-closed'} ? 1 : 0;
+        return $opts;
     },
 });
 
@@ -682,6 +717,11 @@ sub start_envs {
 
         my $already = PVE::EnvManager::lock_db(sub {
             my ($locked_db) = @_;
+            my $env = $locked_db->{environments}->{$id} or die "environment '$id' vanished\n";
+            if (!$running->{$vmid}) {
+                my $err = PVE::EnvManager::check_start_allowed($locked_db, $env);
+                die "not starting environment $id: $err\n" if $err;
+            }
             return PVE::EnvManager::reserve_start($locked_db, $id, $running);
         });
         if ($already) {
@@ -909,7 +949,7 @@ __PACKAGE__->register_method({
 
         my $stats = $get_vm_stats->();
         my $vm = defined($env->{vmid}) ? $stats->{ $env->{vmid} } : undef;
-        return PVE::EnvManager::merge_status($env, $vm);
+        return PVE::EnvManager::merge_status($env, $vm, $db);
     },
 });
 
@@ -1084,6 +1124,655 @@ __PACKAGE__->register_method({
             die $err;
         }
         return $upid;
+    },
+});
+
+# ---------------------------------------------------------------------------
+# proxy pool
+# ---------------------------------------------------------------------------
+
+PVE::JSONSchema::register_format(
+    'pve-env-proxy-id',
+    sub {
+        my ($id, $noerr) = @_;
+        if ($id !~ m/^px-[0-9a-f]{8}$/) {
+            return undef if $noerr;
+            die "invalid proxy ID '$id'\n";
+        }
+        return $id;
+    },
+);
+
+my $proxy_id_option = {
+    description => "The proxy ID.",
+    type => 'string',
+    format => 'pve-env-proxy-id',
+};
+
+my $proxy_meta_properties = {
+    provider => {
+        type => 'string',
+        maxLength => 64,
+        optional => 1,
+        description => "Provider name, for reference.",
+    },
+    region => {
+        type => 'string',
+        maxLength => 64,
+        optional => 1,
+        description => "Region/country as declared by the provider.",
+    },
+    notes => { type => 'string', maxLength => 1024, optional => 1 },
+    expires => {
+        type => 'integer',
+        minimum => 0,
+        optional => 1,
+        description => "Lease end as UNIX epoch (0 = no expiry). Expired proxies are"
+            . " treated as unusable.",
+    },
+    'max-bindings' => {
+        type => 'integer',
+        minimum => 0,
+        maximum => 1000,
+        optional => 1,
+        description => "How many environments may use this proxy (0 = unlimited,"
+            . " default 1 = exclusive).",
+    },
+};
+
+my $proxy_endpoint_properties = {
+    type => {
+        type => 'string',
+        enum => [qw(http https socks5)],
+        optional => 1,
+        description => "Proxy protocol.",
+    },
+    host => {
+        type => 'string',
+        pattern => '[A-Za-z0-9.:_-]+',
+        maxLength => 255,
+        optional => 1,
+    },
+    port => { type => 'integer', minimum => 1, maximum => 65535, optional => 1 },
+    username => { type => 'string', maxLength => 255, optional => 1 },
+    password => { type => 'string', maxLength => 255, optional => 1 },
+};
+
+my $proxy_public = sub {
+    my ($db, $proxy) = @_;
+    my $entry = { %$proxy };
+    delete $entry->{'exit-history'};
+    $entry->{label} = PVE::EnvManager::proxy_label($proxy);
+    $entry->{bindings} = PVE::EnvManager::proxy_bindings($db, $proxy->{id});
+    $entry->{expired} = 1 if PVE::EnvManager::proxy_is_expired($proxy);
+    return $entry;
+};
+
+__PACKAGE__->register_method({
+    name => 'proxy_list',
+    path => 'proxies',
+    method => 'GET',
+    description => "List the proxy pool (without credentials).",
+    permissions => {
+        description => "Requires Sys.Audit on '/', or VM.Config.Network on '/vms' (to pick a"
+            . " proxy for an environment).",
+        user => 'all',
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {},
+    },
+    returns => {
+        type => 'array',
+        items => { type => 'object', properties => { id => $proxy_id_option } },
+        links => [{ rel => 'child', href => "{id}" }],
+    },
+    code => sub {
+        my $rpcenv = PVE::RPCEnvironment::get();
+        my $authuser = $rpcenv->get_user();
+
+        raise_perm_exc("/, Sys.Audit")
+            if !$rpcenv->check($authuser, '/', ['Sys.Audit'], 1)
+            && !$rpcenv->check($authuser, '/vms', ['VM.Config.Network'], 1);
+
+        my $db = PVE::EnvManager::read_db();
+        return [map { $proxy_public->($db, $db->{proxies}->{$_}) } sort keys $db->{proxies}->%*];
+    },
+});
+
+my $store_password = sub {
+    my ($proxy_id, $password) = @_;
+    my $secrets = PVE::EnvManager::read_secrets();
+    if (defined($password) && $password ne '') {
+        $secrets->{$proxy_id} = { password => $password };
+    } else {
+        delete $secrets->{$proxy_id};
+    }
+    PVE::EnvManager::write_secrets($secrets);
+};
+
+my $add_proxy_locked = sub {
+    my ($param) = @_;
+
+    my $password = delete $param->{password};
+    return PVE::EnvManager::lock_db(sub {
+        my ($db) = @_;
+        my $proxy = PVE::EnvManager::add_proxy($db, $param);
+        $proxy->{'has-password'} = 1 if defined($password) && $password ne '';
+        $store_password->($proxy->{id}, $password);
+        return $proxy->{id};
+    });
+};
+
+__PACKAGE__->register_method({
+    name => 'proxy_create',
+    path => 'proxies',
+    method => 'POST',
+    description => "Add a proxy to the pool, either via 'url' or via type/host/port.",
+    permissions => {
+        check => ['perm', '/', ['Sys.Modify']],
+    },
+    protected => 1,
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            url => {
+                type => 'string',
+                maxLength => 1024,
+                optional => 1,
+                description => "Proxy as 'type://user:pass\@host:port' or"
+                    . " 'host:port[:user:pass]'.",
+            },
+            $proxy_endpoint_properties->%*,
+            $proxy_meta_properties->%*,
+        },
+    },
+    returns => $proxy_id_option,
+    code => sub {
+        my ($param) = @_;
+
+        my $endpoint;
+        if (defined(my $url = extract_param($param, 'url'))) {
+            $endpoint = eval { PVE::EnvManager::parse_proxy_line($url, $param->{type}) };
+            raise_param_exc({ url => "$@" }) if $@;
+            for my $k (qw(host port username password)) {
+                raise_param_exc({ $k => "cannot be combined with 'url'" })
+                    if defined($param->{$k});
+            }
+        } else {
+            for my $k (qw(type host port)) {
+                raise_param_exc({ $k => "property is missing" }) if !defined($param->{$k});
+            }
+            $endpoint = {};
+        }
+
+        my $data = { %$param, %$endpoint };
+        return $add_proxy_locked->($data);
+    },
+});
+
+__PACKAGE__->register_method({
+    name => 'proxy_import',
+    path => 'proxy-import',
+    method => 'POST',
+    description => "Import multiple proxies, one per line. Lines that fail are reported, the"
+        . " others are added.",
+    permissions => {
+        check => ['perm', '/', ['Sys.Modify']],
+    },
+    protected => 1,
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            data => {
+                type => 'string',
+                maxLength => 1024 * 1024,
+                description => "Proxy lines ('type://user:pass\@host:port' or"
+                    . " 'host:port[:user:pass]'). Empty lines and lines starting with '#'"
+                    . " are ignored.",
+            },
+            'default-type' => {
+                type => 'string',
+                enum => [qw(http https socks5)],
+                default => 'http',
+                optional => 1,
+                description => "Type for lines without scheme.",
+            },
+            $proxy_meta_properties->%*,
+        },
+    },
+    returns => {
+        type => 'object',
+        properties => {
+            added => { type => 'array', items => $proxy_id_option },
+            errors => { type => 'array', items => { type => 'string' } },
+        },
+    },
+    code => sub {
+        my ($param) = @_;
+
+        my $data = extract_param($param, 'data');
+        my $default_type = extract_param($param, 'default-type') // 'http';
+
+        my $res = { added => [], errors => [] };
+        my $lineno = 0;
+        for my $line (split(/\r?\n/, $data)) {
+            $lineno++;
+            next if $line =~ m/^\s*(?:#|$)/;
+            my $id = eval {
+                my $endpoint = PVE::EnvManager::parse_proxy_line($line, $default_type);
+                $add_proxy_locked->({ %$param, %$endpoint });
+            };
+            if (my $err = $@) {
+                chomp $err;
+                push $res->{errors}->@*, "line $lineno: $err";
+            } else {
+                push $res->{added}->@*, $id;
+            }
+        }
+        return $res;
+    },
+});
+
+__PACKAGE__->register_method({
+    name => 'proxy_read',
+    path => 'proxies/{proxyid}',
+    method => 'GET',
+    description => "Get a proxy, including its exit IP history.",
+    permissions => {
+        check => ['perm', '/', ['Sys.Audit']],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => { proxyid => $proxy_id_option },
+    },
+    returns => { type => 'object' },
+    code => sub {
+        my ($param) = @_;
+        my $db = PVE::EnvManager::read_db();
+        my $proxy = $db->{proxies}->{ $param->{proxyid} }
+            or raise_param_exc({ proxyid => "proxy does not exist" });
+        my $entry = $proxy_public->($db, $proxy);
+        $entry->{'exit-history'} = $proxy->{'exit-history'} // [];
+        return $entry;
+    },
+});
+
+__PACKAGE__->register_method({
+    name => 'proxy_update',
+    path => 'proxies/{proxyid}',
+    method => 'PUT',
+    description => "Update a proxy. Changing the endpoint keeps existing bindings, but resets"
+        . " the observed state.",
+    permissions => {
+        check => ['perm', '/', ['Sys.Modify']],
+    },
+    protected => 1,
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            proxyid => $proxy_id_option,
+            $proxy_endpoint_properties->%*,
+            $proxy_meta_properties->%*,
+            state => {
+                type => 'string',
+                enum => [qw(active disabled)],
+                optional => 1,
+                description => "Enable or disable the proxy. Re-enabling a failed proxy resets"
+                    . " its failure counter.",
+            },
+            delete => {
+                type => 'string',
+                format => 'pve-configid-list',
+                optional => 1,
+                description => "Properties to remove (provider, region, notes, expires,"
+                    . " username, password).",
+            },
+        },
+    },
+    returns => { type => 'null' },
+    code => sub {
+        my ($param) = @_;
+
+        my $id = extract_param($param, 'proxyid');
+        my $delete = [PVE::Tools::split_list(extract_param($param, 'delete') // '')];
+        my $password = extract_param($param, 'password');
+
+        PVE::EnvManager::lock_db(sub {
+            my ($db) = @_;
+            my $proxy = $db->{proxies}->{$id}
+                or raise_param_exc({ proxyid => "proxy does not exist" });
+
+            my $endpoint_changed = 0;
+            for my $k (qw(type host port username)) {
+                next if !defined($param->{$k});
+                $endpoint_changed = 1 if ($proxy->{$k} // '') ne $param->{$k};
+                $proxy->{$k} = $param->{$k};
+            }
+            for my $k (keys %$proxy_meta_properties) {
+                $proxy->{$k} = $param->{$k} if defined($param->{$k});
+            }
+            for my $k (@$delete) {
+                raise_param_exc({ delete => "cannot delete '$k'" })
+                    if $k !~ m/^(?:provider|region|notes|expires|username|password)$/;
+                if ($k eq 'password') {
+                    $password = '';
+                } else {
+                    $endpoint_changed = 1 if $k eq 'username';
+                    delete $proxy->{$k};
+                }
+            }
+
+            if (defined($password)) {
+                $store_password->($id, $password);
+                if ($password ne '') {
+                    $proxy->{'has-password'} = 1;
+                } else {
+                    delete $proxy->{'has-password'};
+                }
+                $endpoint_changed = 1;
+            }
+
+            if (my $state = $param->{state}) {
+                $proxy->{state} = $state;
+                $proxy->{fails} = 0;
+            }
+
+            if ($endpoint_changed) {
+                $proxy->{fails} = 0;
+                delete $proxy->{'last-check'};
+            }
+        });
+        return undef;
+    },
+});
+
+__PACKAGE__->register_method({
+    name => 'proxy_delete',
+    path => 'proxies/{proxyid}',
+    method => 'DELETE',
+    description => "Remove a proxy from the pool.",
+    permissions => {
+        check => ['perm', '/', ['Sys.Modify']],
+    },
+    protected => 1,
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            proxyid => $proxy_id_option,
+            force => {
+                type => 'boolean',
+                optional => 1,
+                default => 0,
+                description => "Also remove existing bindings.",
+            },
+        },
+    },
+    returns => { type => 'null' },
+    code => sub {
+        my ($param) = @_;
+        PVE::EnvManager::lock_db(sub {
+            my ($db) = @_;
+            PVE::EnvManager::remove_proxy($db, $param->{proxyid}, $param->{force});
+            $store_password->($param->{proxyid}, undef);
+        });
+        return undef;
+    },
+});
+
+# Fetch the check URL through the proxy using curl. The configuration,
+# including credentials, is passed on stdin so that it does not show up in
+# the process list.
+sub run_proxy_check {
+    my ($proxy, $password, $url, $timeout) = @_;
+
+    $timeout //= 20;
+
+    my $quote = sub {
+        my ($str) = @_;
+        $str =~ s/(["\\])/\\$1/g;
+        return "\"$str\"";
+    };
+
+    my $scheme = $proxy->{type} eq 'socks5' ? 'socks5h' : $proxy->{type};
+    my $host = $proxy->{host} =~ m/:/ ? "[$proxy->{host}]" : $proxy->{host};
+
+    my $cfg = "silent\nshow-error\nfail\n";
+    $cfg .= "proxy = " . $quote->("$scheme://$host:$proxy->{port}") . "\n";
+    if (defined($proxy->{username})) {
+        $cfg .= "proxy-user = " . $quote->("$proxy->{username}:" . ($password // '')) . "\n";
+    }
+    $cfg .= "max-time = $timeout\n";
+    $cfg .= "url = " . $quote->($url) . "\n";
+    $cfg .= "write-out = " . $quote->("\\n%{time_total}") . "\n";
+
+    my $out = '';
+    my $err = '';
+    eval {
+        PVE::Tools::run_command(
+            ['curl', '--config', '-'],
+            input => $cfg,
+            outfunc => sub { $out .= "$_[0]\n" },
+            errfunc => sub { $err .= "$_[0]\n" },
+            timeout => $timeout + 10,
+        );
+    };
+    if (my $cmd_err = $@) {
+        $err =~ s/\s+$//;
+        return { ok => 0, error => ($err ne '' ? $err : "$cmd_err") =~ s/\s+$//r };
+    }
+
+    $out =~ s/\s+$//;
+    my ($body, $time) = $out =~ m/^(.*)\n([0-9.]+)$/s;
+    return { ok => 0, error => "unexpected curl output" } if !defined($time);
+
+    my $info = eval { PVE::EnvManager::parse_check_response($body) };
+    if (my $parse_err = $@) {
+        chomp $parse_err;
+        return { ok => 0, error => $parse_err };
+    }
+
+    return { ok => 1, latency => int($time * 1000), %$info };
+}
+
+my $check_one = sub {
+    my ($proxy_id) = @_;
+
+    my $db = PVE::EnvManager::read_db();
+    my $proxy = $db->{proxies}->{$proxy_id} or die "proxy '$proxy_id' does not exist\n";
+    my $url = PVE::EnvManager::get_options($db)->{'proxy-check-url'};
+    my $secrets = PVE::EnvManager::read_secrets();
+
+    my $result =
+        run_proxy_check($proxy, ($secrets->{$proxy_id} // {})->{password}, $url);
+
+    my $events = PVE::EnvManager::lock_db(sub {
+        my ($locked_db) = @_;
+        return [] if !$locked_db->{proxies}->{$proxy_id}; # removed meanwhile
+        return PVE::EnvManager::apply_check_result($locked_db, $proxy_id, $result);
+    });
+
+    return ($result, $events);
+};
+
+__PACKAGE__->register_method({
+    name => 'proxy_check',
+    path => 'proxies/{proxyid}/check',
+    method => 'POST',
+    description => "Check a proxy now: reachability, authentication, exit IP and latency.",
+    permissions => {
+        check => ['perm', '/', ['Sys.Modify']],
+    },
+    protected => 1,
+    parameters => {
+        additionalProperties => 0,
+        properties => { proxyid => $proxy_id_option },
+    },
+    returns => {
+        type => 'object',
+        properties => {
+            ok => { type => 'boolean' },
+            latency => { type => 'integer', optional => 1, description => "In milliseconds." },
+            ip => { type => 'string', optional => 1 },
+            country => { type => 'string', optional => 1 },
+            region => { type => 'string', optional => 1 },
+            city => { type => 'string', optional => 1 },
+            error => { type => 'string', optional => 1 },
+            events => { type => 'array', items => { type => 'string' } },
+        },
+    },
+    code => sub {
+        my ($param) = @_;
+        my ($result, $events) = $check_one->($param->{proxyid});
+        return { %$result, ok => $result->{ok} ? 1 : 0, events => $events };
+    },
+});
+
+__PACKAGE__->register_method({
+    name => 'proxy_check_all',
+    path => 'proxy-check',
+    method => 'POST',
+    description => "Check all enabled proxies in a background task (used by the periodic"
+        . " health check).",
+    permissions => {
+        check => ['perm', '/', ['Sys.Modify']],
+    },
+    protected => 1,
+    parameters => {
+        additionalProperties => 0,
+        properties => {},
+    },
+    returns => { type => 'string', description => "UPID of the worker." },
+    code => sub {
+        my $rpcenv = PVE::RPCEnvironment::get();
+        my $authuser = $rpcenv->get_user();
+
+        my $worker = sub {
+            my $db = PVE::EnvManager::read_db();
+            my $ids = [
+                grep { $db->{proxies}->{$_}->{state} ne 'disabled' }
+                    sort keys $db->{proxies}->%*
+            ];
+            print "checking " . scalar(@$ids) . " proxies\n";
+
+            my $failed = 0;
+            for my $id (@$ids) {
+                my ($result, $events) = eval { $check_one->($id) };
+                if (my $err = $@) {
+                    log_warn("$id: $err");
+                    $failed++;
+                    next;
+                }
+                if ($result->{ok}) {
+                    print "$id: ok, exit $result->{ip}, $result->{latency} ms\n";
+                } else {
+                    log_warn("$id: check failed - $result->{error}\n");
+                    $failed++;
+                }
+                print "$_\n" for @$events;
+            }
+            print "$failed of " . scalar(@$ids) . " checks failed\n";
+        };
+
+        return $rpcenv->fork_worker('envproxycheck', undef, $authuser, $worker);
+    },
+});
+
+# ---------------------------------------------------------------------------
+# environment <-> proxy binding
+# ---------------------------------------------------------------------------
+
+__PACKAGE__->register_method({
+    name => 'bind_proxy',
+    path => 'envs/{id}/proxy',
+    method => 'POST',
+    description => "Bind a proxy to an environment for long-term use.",
+    permissions => {
+        description => "Requires VM.Config.Network on the environment's VM.",
+        user => 'all',
+    },
+    protected => 1,
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            id => $env_id_option,
+            proxy => $proxy_id_option,
+        },
+    },
+    returns => { type => 'object' },
+    code => sub {
+        my ($param) = @_;
+
+        my $rpcenv = PVE::RPCEnvironment::get();
+        my $authuser = $rpcenv->get_user();
+
+        return PVE::EnvManager::lock_db(sub {
+            my ($db) = @_;
+            my $env = $get_env->($db, $param->{id});
+            $check_env_priv->($rpcenv, $authuser, $env, ['VM.Config.Network']);
+            return PVE::EnvManager::bind_proxy($db, $param->{id}, $param->{proxy});
+        });
+    },
+});
+
+__PACKAGE__->register_method({
+    name => 'unbind_proxy',
+    path => 'envs/{id}/proxy',
+    method => 'DELETE',
+    description => "Remove the proxy binding of an environment.",
+    permissions => {
+        description => "Requires VM.Config.Network on the environment's VM.",
+        user => 'all',
+    },
+    protected => 1,
+    parameters => {
+        additionalProperties => 0,
+        properties => { id => $env_id_option },
+    },
+    returns => { type => 'null' },
+    code => sub {
+        my ($param) = @_;
+
+        my $rpcenv = PVE::RPCEnvironment::get();
+        my $authuser = $rpcenv->get_user();
+
+        PVE::EnvManager::lock_db(sub {
+            my ($db) = @_;
+            my $env = $get_env->($db, $param->{id});
+            $check_env_priv->($rpcenv, $authuser, $env, ['VM.Config.Network']);
+            PVE::EnvManager::unbind_proxy($db, $param->{id});
+        });
+        return undef;
+    },
+});
+
+__PACKAGE__->register_method({
+    name => 'accept_exit_ip',
+    path => 'envs/{id}/accept-exit-ip',
+    method => 'POST',
+    description => "Accept the bound proxy's current exit IP after it changed.",
+    permissions => {
+        description => "Requires VM.Config.Network on the environment's VM.",
+        user => 'all',
+    },
+    protected => 1,
+    parameters => {
+        additionalProperties => 0,
+        properties => { id => $env_id_option },
+    },
+    returns => { type => 'object' },
+    code => sub {
+        my ($param) = @_;
+
+        my $rpcenv = PVE::RPCEnvironment::get();
+        my $authuser = $rpcenv->get_user();
+
+        return PVE::EnvManager::lock_db(sub {
+            my ($db) = @_;
+            my $env = $get_env->($db, $param->{id});
+            $check_env_priv->($rpcenv, $authuser, $env, ['VM.Config.Network']);
+            return PVE::EnvManager::accept_exit_ip($db, $param->{id});
+        });
     },
 });
 

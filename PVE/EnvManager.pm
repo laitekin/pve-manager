@@ -18,6 +18,10 @@ use JSON;
 
 our $DB_DIR = '/etc/pve/env-manager';
 our $DB_PATH = "$DB_DIR/environments.json";
+
+# proxy credentials live in the root-only part of pmxcfs
+our $SECRETS_DIR = '/etc/pve/priv/env-manager';
+our $SECRETS_PATH = "$SECRETS_DIR/proxy-secrets.json";
 our $DB_VERSION = 1;
 
 # a reservation for a start that was not confirmed within this time is
@@ -28,7 +32,18 @@ our $OPTION_DEFAULTS = {
     'max-envs' => 0, # 0 means unlimited
     'max-running' => 0,
     'max-creating' => 4,
+    # URL fetched through each proxy to detect its exit IP. JSON answers with
+    # 'ip' and optionally 'country'/'region'/'city' are understood, as is a
+    # plain-text IP address.
+    'proxy-check-url' => 'https://ipinfo.io/json',
+    # consecutive failed checks after which a proxy is marked as failed
+    'proxy-fail-threshold' => 3,
+    # refuse to start environments whose bound proxy is failed/disabled
+    'proxy-fail-closed' => 1,
 };
+
+# number of exit IP changes kept per proxy
+our $EXIT_HISTORY_SIZE = 20;
 
 my $STATES = {
     creating => 1, # clone task queued or running
@@ -46,6 +61,7 @@ sub empty_db {
     return {
         version => $DB_VERSION,
         environments => {},
+        proxies => {},
         options => {},
     };
 }
@@ -64,6 +80,7 @@ sub parse_db {
         if $db->{version} > $DB_VERSION;
 
     $db->{environments} //= {};
+    $db->{proxies} //= {};
     $db->{options} //= {};
 
     return $db;
@@ -128,16 +145,26 @@ sub os_family {
     return 'other';
 }
 
-sub new_env_id {
-    my ($db, $rand) = @_;
+my $new_id = sub {
+    my ($prefix, $existing, $rand) = @_;
 
     $rand //= sub { int(rand(0xffffffff)) };
 
     for (1 .. 100) {
-        my $id = sprintf('env-%08x', $rand->());
-        return $id if !$db->{environments}->{$id};
+        my $id = sprintf('%s-%08x', $prefix, $rand->());
+        return $id if !$existing->{$id};
     }
-    die "unable to generate unique environment ID\n";
+    die "unable to generate unique ID\n";
+};
+
+sub new_env_id {
+    my ($db, $rand) = @_;
+    return $new_id->('env', $db->{environments}, $rand);
+}
+
+sub new_proxy_id {
+    my ($db, $rand) = @_;
+    return $new_id->('px', $db->{proxies}, $rand);
 }
 
 sub find_by_vmid {
@@ -277,7 +304,7 @@ sub clear_start_reservation {
 # PVE::API2Tools::extract_vm_stats, or undef if the VM does not exist) into an
 # API result entry. 'health' summarizes management state for the UI.
 sub merge_status {
-    my ($env, $vm) = @_;
+    my ($env, $vm, $db) = @_;
 
     my $entry = { %$env };
     delete $entry->{'start-reserved'};
@@ -291,6 +318,10 @@ sub merge_status {
             $entry->{$k} = $vm->{$k} if defined($vm->{$k});
         }
         $entry->{health} = $state eq 'ready' ? 'ok' : $state;
+        if ($entry->{health} eq 'ok' && $db) {
+            my $proxy_health = binding_health($db, $env);
+            $entry->{health} = $proxy_health if $proxy_health ne 'ok';
+        }
     } else {
         $entry->{status} = 'absent';
         if ($state eq 'ready') {
@@ -301,7 +332,345 @@ sub merge_status {
         }
     }
 
+    if ($db && (my $binding = $env->{'proxy-binding'})) {
+        if (my $proxy = $db->{proxies}->{ $binding->{proxy} }) {
+            $entry->{'proxy-state'} = $proxy->{state};
+            $entry->{'proxy-label'} = proxy_label($proxy);
+            $entry->{'exit-ip'} = $proxy->{'exit-ip'} if defined($proxy->{'exit-ip'});
+        }
+    }
+
     return $entry;
+}
+
+# ---------------------------------------------------------------------------
+# proxy pool
+#
+# A proxy record describes an upstream proxy endpoint and its observed state:
+#   { id, type, host, port, username, provider, region, notes, 'expires',
+#     state => active|disabled|failed, fails, 'last-check' => {...},
+#     'exit-ip', 'exit-country', 'exit-history' => [...] }
+# Passwords are kept in a separate root-only file, keyed by proxy id.
+#
+# An environment binds to at most one proxy:
+#   $env->{'proxy-binding'} = { proxy, bound, 'exit-ip' (accepted exit IP) }
+# A proxy serves at most 'max-bindings' environments (default 1), so a
+# long-term binding is not silently shared.
+# ---------------------------------------------------------------------------
+
+my $PROXY_TYPES = { http => 1, https => 1, socks5 => 1 };
+
+sub proxy_label {
+    my ($proxy) = @_;
+    my $host = $proxy->{host} =~ m/:/ ? "[$proxy->{host}]" : $proxy->{host};
+    return "$proxy->{type}://$host:$proxy->{port}";
+}
+
+# Parse one proxy line. Accepted forms:
+#   type://[user[:pass]@]host:port
+#   host:port[:user:pass]
+# Returns a hash with type, host, port and optionally username/password.
+sub parse_proxy_line {
+    my ($line, $default_type) = @_;
+
+    $default_type //= 'http';
+    $line =~ s/^\s+|\s+$//g;
+    die "empty proxy line\n" if $line eq '';
+
+    my $res = {};
+    my $rest = $line;
+    if ($rest =~ s!^([a-z0-9]+)://!!i) {
+        my $type = lc($1);
+        $type = 'socks5' if $type eq 'socks5h' || $type eq 'socks';
+        $res->{type} = $type;
+        if ($rest =~ s/^(.*)@//) {
+            my ($user, $pass) = split(/:/, $1, 2);
+            $res->{username} = uri_unescape($user);
+            $res->{password} = uri_unescape($pass) if defined($pass);
+        }
+        $rest =~ s!/+$!!;
+        if ($rest =~ m/^\[([0-9a-fA-F:.]+)\]:(\d+)$/ || $rest =~ m/^([^:\[\]\s]+):(\d+)$/) {
+            ($res->{host}, $res->{port}) = ($1, $2);
+        } else {
+            die "unable to parse proxy address '$rest'\n";
+        }
+    } else {
+        my @parts = split(/:/, $rest);
+        die "unable to parse proxy line '$line'\n" if @parts != 2 && @parts != 4;
+        $res->{type} = $default_type;
+        ($res->{host}, $res->{port}) = @parts[0, 1];
+        if (@parts == 4) {
+            ($res->{username}, $res->{password}) = @parts[2, 3];
+        }
+    }
+
+    die "unsupported proxy type '$res->{type}'\n" if !$PROXY_TYPES->{ $res->{type} };
+    die "invalid proxy host '$res->{host}'\n" if $res->{host} !~ m/^[A-Za-z0-9.:_-]+$/;
+    die "invalid proxy port '$res->{port}'\n"
+        if $res->{port} !~ m/^\d+$/ || $res->{port} < 1 || $res->{port} > 65535;
+    $res->{port} += 0;
+
+    return $res;
+}
+
+sub uri_unescape {
+    my ($str) = @_;
+    return $str if !defined($str);
+    $str =~ s/%([0-9A-Fa-f]{2})/chr(hex($1))/eg;
+    return $str;
+}
+
+sub find_proxy_by_endpoint {
+    my ($db, $type, $host, $port, $username) = @_;
+    for my $proxy (values $db->{proxies}->%*) {
+        next if $proxy->{type} ne $type || lc($proxy->{host}) ne lc($host);
+        next if $proxy->{port} != $port;
+        next if ($proxy->{username} // '') ne ($username // '');
+        return $proxy;
+    }
+    return undef;
+}
+
+# Add a proxy record; returns it. Dies on duplicates.
+sub add_proxy {
+    my ($db, $param, $rand) = @_;
+
+    if (my $dup = find_proxy_by_endpoint(
+        $db, $param->{type}, $param->{host}, $param->{port}, $param->{username},
+    )) {
+        die "proxy " . proxy_label($dup) . " already exists as $dup->{id}\n";
+    }
+
+    my $id = new_proxy_id($db, $rand);
+    my $proxy = {
+        id => $id,
+        state => 'active',
+        fails => 0,
+    };
+    for my $k (qw(type host port username provider region notes expires max-bindings)) {
+        $proxy->{$k} = $param->{$k} if defined($param->{$k}) && $param->{$k} ne '';
+    }
+    $db->{proxies}->{$id} = $proxy;
+    return $proxy;
+}
+
+sub proxy_bindings {
+    my ($db, $proxy_id) = @_;
+    my $res = [];
+    for my $id (sort keys $db->{environments}->%*) {
+        my $env = $db->{environments}->{$id};
+        my $binding = $env->{'proxy-binding'} or next;
+        push @$res, $id if $binding->{proxy} eq $proxy_id;
+    }
+    return $res;
+}
+
+sub proxy_is_expired {
+    my ($proxy, $now) = @_;
+    return 0 if !$proxy->{expires};
+    return ($now // time()) >= $proxy->{expires} ? 1 : 0;
+}
+
+sub bind_proxy {
+    my ($db, $env_id, $proxy_id, $now) = @_;
+
+    $now //= time();
+
+    my $env = $db->{environments}->{$env_id} or die "environment '$env_id' does not exist\n";
+    my $proxy = $db->{proxies}->{$proxy_id} or die "proxy '$proxy_id' does not exist\n";
+
+    if (my $cur = $env->{'proxy-binding'}) {
+        return $cur if $cur->{proxy} eq $proxy_id;
+        die "environment '$env_id' is already bound to proxy '$cur->{proxy}', unbind it first\n";
+    }
+
+    die "proxy '$proxy_id' is $proxy->{state}\n" if $proxy->{state} ne 'active';
+    die "proxy '$proxy_id' has expired\n" if proxy_is_expired($proxy, $now);
+
+    my $max = $proxy->{'max-bindings'} // 1;
+    if ($max > 0) {
+        my $count = scalar(proxy_bindings($db, $proxy_id)->@*);
+        die "proxy '$proxy_id' is already used by $count environment(s)\n" if $count >= $max;
+    }
+
+    my $binding = { proxy => $proxy_id, bound => $now };
+    $binding->{'exit-ip'} = $proxy->{'exit-ip'} if defined($proxy->{'exit-ip'});
+    $env->{'proxy-binding'} = $binding;
+    return $binding;
+}
+
+sub unbind_proxy {
+    my ($db, $env_id) = @_;
+    my $env = $db->{environments}->{$env_id} or die "environment '$env_id' does not exist\n";
+    return delete $env->{'proxy-binding'};
+}
+
+# accept the proxy's current exit IP as the expected one for the binding
+sub accept_exit_ip {
+    my ($db, $env_id) = @_;
+    my $env = $db->{environments}->{$env_id} or die "environment '$env_id' does not exist\n";
+    my $binding = $env->{'proxy-binding'} or die "environment '$env_id' has no proxy\n";
+    my $proxy = $db->{proxies}->{ $binding->{proxy} } or die "bound proxy does not exist\n";
+    die "exit IP of proxy '$proxy->{id}' is not known yet\n" if !defined($proxy->{'exit-ip'});
+    $binding->{'exit-ip'} = $proxy->{'exit-ip'};
+    return $binding;
+}
+
+# Health of an environment's proxy binding: 'ok', 'proxy-failed' (proxy
+# failed, disabled, removed or expired) or 'exit-changed' (the proxy's exit
+# IP differs from the one accepted for this binding).
+sub binding_health {
+    my ($db, $env, $now) = @_;
+
+    my $binding = $env->{'proxy-binding'} or return 'ok';
+    my $proxy = $db->{proxies}->{ $binding->{proxy} } or return 'proxy-failed';
+
+    return 'proxy-failed' if $proxy->{state} ne 'active' || proxy_is_expired($proxy, $now);
+
+    my $expected = $binding->{'exit-ip'};
+    my $actual = $proxy->{'exit-ip'};
+    return 'exit-changed' if defined($expected) && defined($actual) && $expected ne $actual;
+
+    return 'ok';
+}
+
+# Returns an error message if an environment must not be started because
+# of its proxy binding (fail-closed), undef otherwise.
+sub check_start_allowed {
+    my ($db, $env, $now) = @_;
+
+    my $opts = get_options($db);
+    return undef if !$opts->{'proxy-fail-closed'};
+
+    my $health = binding_health($db, $env, $now);
+    return undef if $health eq 'ok';
+
+    my $proxy_id = $env->{'proxy-binding'}->{proxy};
+    return "bound proxy '$proxy_id' is not usable" if $health eq 'proxy-failed';
+    return "exit IP of bound proxy '$proxy_id' changed, accept or rebind first"
+        if $health eq 'exit-changed';
+    return "proxy binding not healthy ($health)";
+}
+
+# Parse the body returned by the check URL into { ip, country, region, city }.
+sub parse_check_response {
+    my ($body) = @_;
+
+    $body //= '';
+    $body =~ s/^\s+|\s+$//g;
+
+    my $res = {};
+    if ($body =~ m/^\{/) {
+        my $data = eval { JSON::decode_json($body) };
+        die "invalid JSON from check URL\n" if !$data || ref($data) ne 'HASH';
+        $res->{ip} = $data->{ip} // $data->{query} // $data->{origin};
+        $res->{country} = $data->{country} // $data->{country_code} // $data->{countryCode};
+        $res->{region} = $data->{region} // $data->{regionName};
+        $res->{city} = $data->{city};
+    } else {
+        $res->{ip} = $body;
+    }
+
+    my $ip = $res->{ip} // '';
+    die "check URL did not return an IP address\n"
+        if $ip !~ m/^(?:\d{1,3}(?:\.\d{1,3}){3}|[0-9a-fA-F:]*:[0-9a-fA-F:.]+)$/;
+
+    for my $k (keys %$res) {
+        delete $res->{$k} if !defined($res->{$k}) || ref($res->{$k});
+    }
+    return $res;
+}
+
+# Apply a check result to a proxy. $result is either
+#   { ok => 1, latency => ms, ip => ..., country => ..., ... }
+# or { ok => 0, error => '...' }.
+# Returns a list of event strings (for the task log).
+sub apply_check_result {
+    my ($db, $proxy_id, $result, $now) = @_;
+
+    $now //= time();
+
+    my $proxy = $db->{proxies}->{$proxy_id} or die "proxy '$proxy_id' does not exist\n";
+    my $opts = get_options($db);
+    my $events = [];
+
+    my $check = { time => $now, ok => $result->{ok} ? 1 : 0 };
+    $check->{latency} = $result->{latency} if defined($result->{latency});
+    $check->{error} = $result->{error} if defined($result->{error});
+    $proxy->{'last-check'} = $check;
+
+    if (!$result->{ok}) {
+        $proxy->{fails} = ($proxy->{fails} // 0) + 1;
+        if ($proxy->{state} eq 'active' && $proxy->{fails} >= $opts->{'proxy-fail-threshold'}) {
+            $proxy->{state} = 'failed';
+            push @$events, "proxy $proxy_id marked as failed after $proxy->{fails} failed checks";
+        }
+        return $events;
+    }
+
+    $proxy->{fails} = 0;
+    if ($proxy->{state} eq 'failed') {
+        $proxy->{state} = 'active';
+        push @$events, "proxy $proxy_id recovered";
+    }
+
+    my $ip = $result->{ip};
+    my $old = $proxy->{'exit-ip'};
+    if (defined($ip) && (!defined($old) || $old ne $ip)) {
+        $proxy->{'exit-ip'} = $ip;
+        $proxy->{'exit-since'} = $now;
+        my $history = ($proxy->{'exit-history'} //= []);
+        unshift @$history, { ip => $ip, time => $now };
+        splice(@$history, $EXIT_HISTORY_SIZE) if @$history > $EXIT_HISTORY_SIZE;
+        push @$events, defined($old)
+            ? "proxy $proxy_id exit IP changed from $old to $ip"
+            : "proxy $proxy_id exit IP is $ip";
+    }
+    for my $k (qw(country region city)) {
+        if (defined($result->{$k})) {
+            $proxy->{"exit-$k"} = $result->{$k};
+        }
+    }
+
+    # first successful check after binding: remember the exit IP
+    for my $env_id (proxy_bindings($db, $proxy_id)->@*) {
+        my $binding = $db->{environments}->{$env_id}->{'proxy-binding'};
+        $binding->{'exit-ip'} //= $ip if defined($ip);
+        if (defined($binding->{'exit-ip'}) && defined($ip) && $binding->{'exit-ip'} ne $ip) {
+            push @$events, "environment $env_id: exit IP differs from bound $binding->{'exit-ip'}";
+        }
+    }
+
+    return $events;
+}
+
+sub remove_proxy {
+    my ($db, $proxy_id, $force) = @_;
+    $db->{proxies}->{$proxy_id} or die "proxy '$proxy_id' does not exist\n";
+    my $bound = proxy_bindings($db, $proxy_id);
+    if (scalar(@$bound)) {
+        die "proxy '$proxy_id' is bound to " . join(', ', @$bound) . "\n" if !$force;
+        delete $db->{environments}->{$_}->{'proxy-binding'} for @$bound;
+    }
+    delete $db->{proxies}->{$proxy_id};
+    return $bound;
+}
+
+# --- secrets (root only) ---
+
+sub read_secrets {
+    return {} if !-f $SECRETS_PATH;
+    require PVE::Tools;
+    my $raw = PVE::Tools::file_get_contents($SECRETS_PATH);
+    return {} if $raw !~ m/\S/;
+    return JSON::decode_json($raw);
+}
+
+sub write_secrets {
+    my ($secrets) = @_;
+    require PVE::Tools;
+    mkdir $SECRETS_DIR if !-d $SECRETS_DIR;
+    PVE::Tools::file_set_contents($SECRETS_PATH, JSON->new->utf8->canonical->encode($secrets), 0600);
 }
 
 1;

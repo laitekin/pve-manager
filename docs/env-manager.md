@@ -75,6 +75,41 @@
 | `www/manager6/window/EnvironmentCreate.js` | 创建/编辑/配额/纳管窗口 |
 | `test/env_manager_test.pl` | 单元测试（`make -C test test-env-manager`） |
 
+## 第 2 阶段（上）：代理池、长期绑定与巡检（已实现，待上机验收）
+
+### 代理池
+
+- 记录：类型（http/https/socks5）、主机、端口、用户名、供应商、声明地区、到期时间、可绑定数（默认 1 = 独占）、备注。
+- 密码单独保存在 `/etc/pve/priv/env-manager/proxy-secrets.json`（仅 root 可读），列表接口只返回 `has-password`。
+- 批量导入：每行 `type://user:pass@host:port` 或 `host:port[:user:pass]`，逐行返回成功/失败原因，重复项拒绝。
+
+### 健康巡检
+
+- 通过代理用 `curl` 访问 `proxy-check-url`（默认 `https://ipinfo.io/json`，可改成自建接口），记录可达性、认证、出口 IP、国家/地区/城市、延迟和检测时间。凭据经 stdin 传给 curl，不出现在进程列表。
+- 连续失败 `proxy-fail-threshold` 次（默认 3）→ 状态 `failed`；再次成功自动恢复 `active`。
+- 出口 IP 变化保存历史（最近 20 条），**不会静默替换**：绑定记录保存「已接受的出口 IP」，与当前出口不一致时环境健康显示 `exit-changed`，需人工「接受新出口 IP」或改绑。
+- 定时：`pve-env-proxycheck.timer` 每 5 分钟执行 `pvesh create /cluster/environments/proxy-check`。多节点集群里每个节点都会跑一次（结果相同，后续可改为只在一个节点执行）。
+
+### 绑定与故障阻断
+
+- 环境 → 代理 → 出口 IP 三者分开记录：`proxy-binding = { proxy, bound, exit-ip }`。
+- `proxy-fail-closed`（默认开）：代理失败、被禁用、已删除、已到期或出口 IP 变化未确认时，**拒绝启动**该环境（任务日志写明原因）。
+- 注意：这是启动准入层面的阻断。运行中的 VM 网络层强制出站尚未实现，见下方第 2 阶段（下）。
+
+### 新增接口
+
+| 方法 | 路径 | 说明 | 权限 |
+| --- | --- | --- | --- |
+| GET/POST | `proxies` | 列表 / 新增（`url` 或分字段） | Sys.Audit（或 /vms 的 VM.Config.Network）/ Sys.Modify |
+| POST | `proxy-import` | 多行批量导入 | Sys.Modify |
+| GET/PUT/DELETE | `proxies/{proxyid}` | 详情（含出口历史）/ 修改、启用禁用 / 删除（`force` 同时解除绑定） | Sys.Audit / Sys.Modify |
+| POST | `proxies/{proxyid}/check` | 立即检测单个代理 | Sys.Modify |
+| POST | `proxy-check` | 后台任务检测全部 | Sys.Modify |
+| POST/DELETE | `envs/{id}/proxy` | 绑定 / 解绑 | VM.Config.Network |
+| POST | `envs/{id}/accept-exit-ip` | 接受新的出口 IP | VM.Config.Network |
+
+网页：数据中心 → Environments → **Proxies**（新增、导入、编辑、检测、全部检测、启用/禁用、删除）；环境列表新增「代理」「出口 IP」列和「Proxy」菜单（绑定、解绑、接受新出口 IP）。
+
 ## 上机验收清单（第 1 阶段）
 
 在与源码版本匹配的 PVE 测试节点上：
@@ -90,7 +125,7 @@
 
 ## 后续阶段
 
-- **第 2 阶段：代理与网络**——代理池、长期绑定、健康巡检、出口 IP 记录；客体外强制出站（每环境独立网桥/网关 + nftables 默认拒绝，代理故障即阻断，覆盖 DNS/UDP/IPv6）；环境间及宿主管理面隔离。
+- **第 2 阶段（下）：网络层强制出站与隔离**——客体外执行：每环境独立网段，默认拒绝一切出站，只允许到网关；网关把 TCP 转到绑定代理，DNS 经代理解析，UDP/IPv6 默认阻断；代理故障时流量直接断开；禁止环境互访和访问宿主管理面。需先确定网关形态（见下）。
 - **第 3 阶段：资源与管理**——带宽/IO 限制、启动排队（目前是超限直接拒绝）、操作审计、按用户配额、备份恢复后核对绑定。
 - **第 4 阶段**：macOS、多节点调度、应用模板。
 
