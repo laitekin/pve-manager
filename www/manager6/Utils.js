@@ -249,6 +249,30 @@ Ext.define('PVE.Utils', {
             return state;
         },
 
+        render_env_os: function (value) {
+            let map = {
+                windows: 'Windows',
+                linux: 'Linux',
+                solaris: 'Solaris',
+                other: gettext('Other'),
+            };
+            return map[value] ?? Proxmox.Utils.unknownText;
+        },
+
+        render_env_health: function (value, error) {
+            let map = {
+                ok: ['check-circle good', gettext('OK')],
+                creating: ['refresh fa-spin', gettext('Creating')],
+                deleting: ['refresh fa-spin', gettext('Deleting')],
+                missing: ['exclamation-triangle warning', gettext('VM missing')],
+                error: ['times-circle critical', gettext('Error')],
+            };
+            let [icon, text] = map[value] ?? ['question-circle', value ?? ''];
+            let qtip = error ? ` data-qtip="${Ext.htmlEncode(Ext.htmlEncode(error))}"` : '';
+            let warn = error && value === 'ok' ? ' <i class="fa fa-exclamation-circle warning"></i>' : '';
+            return `<span${qtip}><i class="fa fa-fw fa-${icon}"></i> ${text}${warn}</span>`;
+        },
+
         render_zfs_health: function (value) {
             if (typeof value === 'undefined') {
                 return '';
@@ -2198,6 +2222,12 @@ Ext.define('PVE.Utils', {
             dircreate: [gettext('Directory Storage'), gettext('Create')],
             dirremove: [gettext('Directory'), gettext('Remove')],
             download: [gettext('File'), gettext('Download')],
+            envcreate: ['', gettext('Create environments')],
+            envdestroy: [gettext('Environment'), gettext('Destroy')],
+            envreboot: ['', gettext('Reboot environments')],
+            envshutdown: ['', gettext('Shutdown environments')],
+            envstart: ['', gettext('Start environments')],
+            envstop: ['', gettext('Stop environments')],
             hamigrate: ['HA', gettext('Migrate')],
             hashutdown: ['HA', gettext('Shutdown')],
             hastart: ['HA', gettext('Start')],

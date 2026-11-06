@@ -9,6 +9,7 @@ SUBDIRS=Mapping		\
 PERLSOURCE= 			\
 	BackupInfo.pm		\
 	BulkAction.pm		\
+	Environments.pm		\
 	Ceph.pm				\
 	Jobs.pm				\
 	Mapping.pm			\

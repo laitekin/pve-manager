@@ -127,6 +127,7 @@ JSSRC= 							\
 	window/BulkAction.js				\
 	window/CephInstall.js				\
 	window/Clone.js					\
+	window/EnvironmentCreate.js			\
 	window/ConfirmRemoveResource.js			\
 	window/FirewallEnableEdit.js			\
 	window/FirewallLograteEdit.js			\
@@ -179,6 +180,7 @@ JSSRC= 							\
 	dc/CorosyncLinkEdit.js				\
 	dc/CPUTypeEdit.js				\
 	dc/CPUTypeView.js				\
+	dc/Environments.js				\
 	dc/GroupEdit.js					\
 	dc/GroupView.js					\
 	dc/Guests.js					\

@@ -26,6 +26,7 @@ use PVE::API2::ACMEPlugin;
 use PVE::API2::Backup;
 use PVE::API2::Cluster::BackupInfo;
 use PVE::API2::Cluster::BulkAction;
+use PVE::API2::Cluster::Environments;
 use PVE::API2::Cluster::Ceph;
 use PVE::API2::Cluster::Jobs;
 use PVE::API2::Cluster::Mapping;
@@ -115,6 +116,11 @@ __PACKAGE__->register_method({
     path => 'bulk-action',
 });
 
+__PACKAGE__->register_method({
+    subclass => "PVE::API2::Cluster::Environments",
+    path => 'environments',
+});
+
 if ($have_sdn) {
     __PACKAGE__->register_method({
         subclass => "PVE::API2::Network::SDN",
@@ -163,6 +169,7 @@ __PACKAGE__->register_method({
             { name => 'bulk-action' },
             { name => 'ceph' },
             { name => 'config' },
+            { name => 'environments' },
             { name => 'firewall' },
             { name => 'ha' },
             { name => 'jobs' },

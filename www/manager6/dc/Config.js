@@ -123,6 +123,14 @@ Ext.define('PVE.dc.Config', {
             );
         }
 
+        // managed environments; the list is filtered by permissions server-side
+        me.items.push({
+            xtype: 'pveDcEnvironments',
+            title: gettext('Environments'),
+            iconCls: 'fa fa-cubes',
+            itemId: 'environments',
+        });
+
         if (caps.storage['Datastore.Allocate'] || caps.dc['Sys.Audit']) {
             me.items.push({
                 xtype: 'pveStorageView',

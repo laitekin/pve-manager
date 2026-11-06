@@ -9,6 +9,7 @@ PERLSOURCE = 			\
 	AutoBalloon.pm		\
 	CertCache.pm		\
 	CertHelpers.pm		\
+	EnvManager.pm		\
 	ExtMetric.pm		\
 	HTTPServer.pm		\
 	Jobs.pm			\
