@@ -44,6 +44,7 @@ use PVE::Tools qw(file_get_contents);
 use PVE::pvecfg;
 
 use PVE::API2::APT;
+use PVE::API2::Egress;
 use PVE::API2::Capabilities;
 use PVE::API2::Ceph;
 use PVE::API2::Certificates;
@@ -109,6 +110,11 @@ sub verify_command_batch {
     return if $noerr;
     die "commands is not a valid array of commands: $@";
 }
+
+__PACKAGE__->register_method({
+    subclass => 'PVE::API2::Egress',
+    path => 'egress',
+});
 
 __PACKAGE__->register_method({
     subclass => "PVE::API2::Qemu",
@@ -229,6 +235,7 @@ __PACKAGE__->register_method({
         my ($param) = @_;
 
         my $result = [
+            { name => 'egress' },
             { name => 'aplinfo' },
             { name => 'apt' },
             { name => 'capabilities' },

@@ -200,6 +200,13 @@ Ext.define('PVE.node.Config', {
                     onlineHelp: 'sysadmin_network_configuration',
                 },
                 {
+                    title: gettext('Egress Gateway'),
+                    iconCls: 'fa fa-exchange',
+                    itemId: 'egress',
+                    xtype: 'pveNodeEgress',
+                    pveSelNode: me.pveSelNode,
+                },
+                {
                     xtype: 'pveCertificatesView',
                     title: gettext('Certificates'),
                     iconCls: 'fa fa-certificate',

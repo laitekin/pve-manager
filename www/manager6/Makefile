@@ -242,6 +242,7 @@ JSSRC= 							\
 	node/ACME.js					\
 	node/Certificates.js				\
 	node/CmdMenu.js					\
+	node/Egress.js				\
 	node/Config.js					\
 	node/Directory.js				\
 	node/LVM.js					\
