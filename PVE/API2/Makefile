@@ -8,6 +8,7 @@ PERLSOURCE = 			\
 	ACMEPlugin.pm		\
 	APT.pm			\
 	Backup.pm		\
+	Egress.pm			\
 	Capabilities.pm		\
 	Ceph.pm			\
 	Certificates.pm		\
